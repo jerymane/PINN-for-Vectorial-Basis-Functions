@@ -13,44 +13,49 @@ import shutil
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # disable warnings from tensorflow
 os.environ["TF_GPU_ALLOCATOR"] = 'cuda_malloc_async'
-tf.compat.v1.enable_eager_execution()
+
+# tf.compat.v1.enable_eager_execution()
 
 
-NN_WIDTH = 80
+NN_WIDTH = 30
 NN_DEPTH = 2
-EPOCHS = 200
-BATCH_SIZE = 20
-TEST_SET_SIZE = 20
-LR = 1e-3
+EPOCHS = 10000
+BATCH_SIZE = 10
+TEST_SET_SIZE = 10
+LR = 1e-3                   # learning rate (can also be adjusted to be dynamic)
+w_PDE = 10                  # PDE training weight
+w_BCs = 1.0                 # BCS training weight
 
-train = 1
-load_pretrained_model = 0
-plot_histories = 1
+train = 0
+load_pretrained_model = 1
+plot_histories = 0
 
 
 training_quads_dir = r'./training_sets_quads/'
-quads_filename = 'quads100a_sp1_ir5'
-#quads_filename = 'slices40_sp01_ir05_1-40'
+# quads_filename = 'quads100a_sp1_ir5'
+quads_filename = 'slices40_sp01_ir05_1-40'
+# quads_filename = 'quads50a_sp01_ir05'
 bary_coords_path = 'barycentric_unit_square_d500_b200.dat'
 
 quads_path = training_quads_dir + quads_filename
-# dir_path = './output/' + quads_filename + '_nn' + str(NN_WIDTH) + 'x' + str(NN_DEPTH) + '_e' \
-#             + str(EPOCHS) + '_bt' + str(BATCH_SIZE) + '_lr_var' #+ '_lr' + "{:.2e}".format(LR)
+dir_path = './output/' + quads_filename + '_nn' + str(NN_WIDTH) + 'x' + str(NN_DEPTH) + '_e' \
+            + str(EPOCHS) + '_bt' + str(BATCH_SIZE) + '_lr_1e-3' + '_wPDE100' # + '_lr' + "{:.2e}".format(LR)
 dir_path = 'tryout'
 
-load_model_dir_path = './output/quads100a_sp1_ir5_nn1000x2_e20000_bt20_lr_var/'
+load_model_dir_path = 'tryout/'
 
 print('dir path: ', dir_path)
 
-if os.path.exists(dir_path) and os.path.exists(dir_path + '/model/') and train:
-    sys.exit('Proceeding will rewrite the already trained model')
-else:
-    os.makedirs(dir_path)
+if train:
+    if os.path.exists(dir_path) and os.path.exists(dir_path + '/model/'):
+        sys.exit('Proceeding will rewrite the already trained model')
+    else:
+        os.makedirs(dir_path)
 
 
 shutil.copy(quads_path, dir_path+'/')
 
-DTYPE='float32'
+DTYPE='float64'
 dde.config.set_default_float(DTYPE)
 tf.keras.backend.set_floatx(DTYPE)
 
@@ -96,9 +101,10 @@ class PINNSolver():
         self.x = None
         self.y = None
         self.quads = None
-
+        
         self.train_set_quads = quads[TEST_SET_SIZE:]
         self.train_set_pts = collocation_pts[TEST_SET_SIZE:, :, :]
+        self.num_bcs_pts = np.sum(quads[0].num_bcs)
 
 
         self.test_set_quads = quads[:TEST_SET_SIZE]
@@ -114,13 +120,16 @@ class PINNSolver():
         self.hist_error_bcs = []
         self.current_error_pde = 0
         self.current_error_bcs = 0
+        self.current_error_distr = []
+        self.current_test_error_distr = []
 
         self.test_hist = []
         self.test_hist_error_pde = []
         self.test_hist_error_bcs = []
         self.test_current_error_pde = 0
         self.test_current_error_bcs = 0
-
+        self.quad_error_distr_hist = []
+        self.quad_test_error_distr_hist = []
 
     def get_residual(self):
 
@@ -145,17 +154,18 @@ class PINNSolver():
 
         return u_xx + u_yy
     
-    # def get_residual(self):
-    #     #u = self.model(self.x, self.y)       
-    #     self.u = self.model(tf.stack([self.x, self.y], axis=2))
-    #     print('u shape ', self.u.shape)
-    #     self.u_x = tf.gradients(self.u, self.x)[0]
-    #     self.u_y = tf.gradients(self.u, self.y)[0]
-    #     print('u_x shape ', self.u_x.shape)
-    #     u_xx = tf.gradients(self.u_x, self.x)
-    #     u_yy = tf.gradients(self.u_y, self.y)
 
-    #     return u_xx + u_yy
+    def get_residual_eager(self):
+        #u = self.model(self.x, self.y)       
+        self.u = self.model(tf.stack([self.x, self.y], axis=2))
+        print('u shape ', self.u.shape)
+        self.u_x = tf.gradients(self.u, self.x)[0]
+        self.u_y = tf.gradients(self.u, self.y)[0]
+        print('u_x shape ', self.u_x.shape)
+        u_xx = tf.gradients(self.u_x, self.x)
+        u_yy = tf.gradients(self.u_y, self.y)
+
+        return u_xx + u_yy
     
 
     def loss_fn(self, arg):
@@ -165,9 +175,9 @@ class PINNSolver():
     def get_pde_losses(self):
         
         r = self.get_residual()
+        r = r[:, self.num_bcs_pts::]
         loss_pde = self.loss_fn(r)
-        
-        return loss_pde, tf.reduce_mean(r)
+        return loss_pde, r
 
     def boundary_derivative(self, inputs, beg, end):
         with tf.GradientTape(persistent=True) as tp:
@@ -181,113 +191,106 @@ class PINNSolver():
     def get_bcs_losses(self):
         losses = []
         bcs_errors = []
-        total_bcs_error = 0
+        
         for qi, quad in enumerate(self.quads):
-            # print('num_bcs in ' + str(qi) + ': ' + str(quad.num_bcs) )
+            single_quad_bcs_errors = []
             bcs_start = np.cumsum([0] + quad.num_bcs)
             for i, bc in enumerate(quad.bcs):
                 beg, end = bcs_start[i], bcs_start[i + 1]
-
                 value = bc.func(self.collocation_pts[qi,:,:], beg, end, None)
-                #print('value ', value)
+
                 n = bc.boundary_normal(self.collocation_pts[qi,:,:], beg, end, None)
                 bc_d = self.boundary_derivative(tf.convert_to_tensor(self.collocation_pts[qi, :, :], dtype=DTYPE), beg, end)
                 errors = tf.reduce_sum(bc_d * n, axis=1, keepdims=True) - value
-
-                bcs_errors.append(tf.reduce_mean(errors))
+                single_quad_bcs_errors.append(errors)
                 losses.append(self.loss_fn(errors))
+
+            bcs_errors.append(tf.concat(single_quad_bcs_errors, 0))
         return losses, bcs_errors
         
 
     def get_grad(self):
         with tf.GradientTape(persistent=True) as tape:
-            # This tape is for derivatives with
-            # respect to trainable variables
             tape.watch(self.model.trainable_variables)
-            pde_loss, pde_error = self.get_pde_losses()
-            bcs_losses, bcs_error = self.get_bcs_losses()
-            loss = sum(bcs_losses) + pde_loss
-            
-            
+            pde_loss, pde_errors = self.get_pde_losses()
+            bcs_losses, bcs_errors = self.get_bcs_losses()
+            loss = w_BCs*sum(bcs_losses) + w_PDE*pde_loss
         g = tape.gradient(loss, self.model.trainable_variables)
         del tape
         
-        return loss, g, bcs_error, pde_error
+        return loss, g, bcs_errors, pde_errors
 
 
     # @timeit
     def solve_with_TFoptimizer_batches(self, optimizer, epochs=1001):
-        """This method performs a gradient descent type optimization."""
 
         @tf.function
         def train_step():
-            loss, grad_theta, bcs_error, pde_error = self.get_grad()
+            loss, grad_theta, bcs_errors, pde_errors = self.get_grad()
             
             # Perform gradient descent step
             optimizer.apply_gradients(zip(grad_theta, self.model.trainable_variables))
-            return loss, bcs_error, pde_error
+            return loss, bcs_errors, pde_errors
         
         @tf.function
         def test_step():
-            loss, grad_theta, bcs_error, pde_error = self.get_grad()
+            loss, grad_theta, bcs_error, pde_errors = self.get_grad()
 
-            return loss, bcs_error, pde_error
+            return loss, bcs_error, pde_errors
 
 
         for ep in range(epochs):
-            print('Epoch: ', ep)
+            
             self.epoch = ep
             batch_step = 0
             train_set_size = self.train_set_pts.shape[0]
             #print('epoch ', ep)
+            self.current_error_distr = []
+            self.quad_error_distr_hist = []
             while batch_step*BATCH_SIZE < train_set_size:
                 batch_start = batch_step*BATCH_SIZE
                 batch_end = (batch_step+1)*BATCH_SIZE if (batch_step+1)*BATCH_SIZE < train_set_size else train_set_size
                 batch_range = slice(batch_start, batch_end, 1)
-                #print('batch range ', batch_range)
+
                 self.x = tf.convert_to_tensor( self.train_set_pts[batch_range, :, 0], dtype=DTYPE )
                 self.y = tf.convert_to_tensor( self.train_set_pts[batch_range, :, 1], dtype=DTYPE )
                 self.collocation_pts = self.train_set_pts[batch_range, :,:]
                 self.quads = self.train_set_quads[batch_range]
-                                
-                    
-                loss, bcs_error, pde_error = train_step()
-                ## plot weights every 100th training step
-                #if i % 100 == 0:
-                    #print('weights step ', i)
-                    #print(self.model.trainable_variables)
-                    # kernel0 = self.model.trainable_variables[0][25:50]
-                    # plt.imshow(kernel0)
-                    # plt.colorbar()
-                    # plt.savefig(str(i))
-                    # plt.close()
-                self.current_error_bcs = tf.reduce_mean(bcs_error).numpy() # TODO: separate bcs_errors to get better insight
-                self.current_error_pde = pde_error.numpy()
+                loss, bcs_errors, pde_errors = train_step()
+                if ep % 100 == 0:
+                    self.current_error_distr.extend(tf.concat((tf.squeeze(bcs_errors,[-1]), pde_errors), 1))
+
+                self.current_error_bcs = tf.reduce_mean(tf.abs(bcs_errors)).numpy() # TODO: separate bcs_errors to get better insight
+                self.current_error_pde = tf.reduce_mean(tf.abs(pde_errors)).numpy()
                 self.current_loss = loss.numpy()
-                self.callback(step=50)
+                self.callback(step=100)
 
                 if TEST_SET_SIZE != 0:
+                    self.current_test_error_distr = []
+                    self.quad_test_error_distr_hist = []
                     self.x = tf.convert_to_tensor( self.test_set_pts[:, :, 0], dtype=DTYPE )
                     self.y = tf.convert_to_tensor( self.test_set_pts[:, :, 1], dtype=DTYPE )
                     self.collocation_pts = self.test_set_pts
                     self.quads = self.test_set_quads
                     
-                    loss, bcs_error, pde_error = test_step()
-                    self.test_current_error_bcs = tf.reduce_mean(bcs_error).numpy() # TODO: separate bcs_errors to get better insight
-                    self.test_current_error_pde = pde_error.numpy()
-                    self.test_current_loss = loss.numpy()
+                    test_loss, test_bcs_errors, test_pde_errors = test_step()
+                    if ep % 100 == 0:
+                        self.current_test_error_distr.extend(tf.concat((tf.squeeze(test_bcs_errors,[-1]), test_pde_errors), 1))
+                    self.test_current_error_bcs = np.mean(np.abs(test_bcs_errors)) # TODO: separate bcs_errors to get better insight
+                    self.test_current_error_pde = np.mean(np.abs(test_pde_errors))
+                    self.test_current_loss = test_loss.numpy()
                     self.callback_save_test()
             
                 batch_step += 1
             
-
+            
             if ep % 100 == 0:
+                print('Epoch: ', ep)
+                self.quad_error_distr_hist.append(self.current_error_distr)
+                self.quad_test_error_distr_hist.append(self.current_test_error_distr)
                 self.callback_end_of_epoch_save()
             
            
-                
-    
-
 
     # @timeit
     def solve_with_ScipyOptimizer(self, method='L-BFGS-B', **kwargs):
@@ -342,42 +345,6 @@ class PINNSolver():
                 # Assign variables (Casting necessary since scipy requires float64 type)
                 v.assign(tf.cast(new_val, DTYPE))
         
-
-        def get_loss_and_grad(w):
-            """Function that provides current loss and gradient
-            w.r.t the trainable variables as vector. This is mandatory
-            for the LBFGS minimizer from scipy."""
-            
-            # Update weights in model
-            set_weight_tensor(w)
-            # Determine value of \phi and gradient w.r.t. \theta at w
-            loss, grad, bcs_error, pde_error = self.get_grad()
-            
-            # Store current loss for callback function            
-            loss = loss.numpy().astype(DTYPE)
-            self.current_loss = loss            
-            self.current_error_bcs = bcs_error
-            self.current_error_pde = pde_error
-            # Flatten gradient
-            grad_flat = []
-            for g in grad:
-                grad_flat.extend(g.numpy().flatten())
-            
-            # Gradient list to array
-            grad_flat = np.array(grad_flat,dtype=DTYPE)
-            
-            # Return value and gradient of \phi as tuple
-            return loss, grad_flat
-        
-        
-        return scipy.optimize.minimize(fun=get_loss_and_grad,
-                                       x0=x0,
-                                       jac=True,
-                                       method=method,
-                                       callback=self.callback,
-                                       **kwargs)
-        
-
     def callback(self, step=1):
         if self.iter % step == 0:
             print('It {:05d}: loss = {:10.8e}'.format(self.iter,self.current_loss))
@@ -400,6 +367,14 @@ class PINNSolver():
         np.savetxt(dir_path + '/test_loss_history.dat', self.test_hist)
         np.savetxt(dir_path + '/error_history.dat', (self.test_hist_error_pde, self.test_hist_error_bcs))
         np.savetxt(dir_path + '/test_error_history.dat', (self.test_hist_error_pde, self.test_hist_error_bcs))
+        
+        if not os.path.exists(dir_path + '/error_distribution_history/' + str(self.epoch)): 
+            os.makedirs(dir_path + '/error_distribution_history/' + str(self.epoch))
+        np.savetxt(dir_path + '/error_distribution_history/' + str(self.epoch) + '/error_distribution_history.dat', np.array(self.quad_error_distr_hist)[0])
+        
+        if not os.path.exists(dir_path + '/test_error_distribution_history/' + str(self.epoch)): 
+            os.makedirs(dir_path + '/test_error_distribution_history/' + str(self.epoch))
+        np.savetxt(dir_path + '/test_error_distribution_history/' + str(self.epoch) + '/test_error_distribution_history.dat', np.array(self.quad_test_error_distr_hist)[0])
         
 
     def plot_errors_history(self, save=True, show=True):
@@ -446,6 +421,16 @@ class PINNSolver():
         return ax
 
 
+    def plot_model_weights(self, ep):
+        # plot weights every 100th training step
+        print(self.model.trainable_variables)
+        kernel0 = self.model.trainable_variables[0][25:50]
+        plt.imshow(kernel0)
+        plt.colorbar()
+        plt.savefig('Epoch: ', str(ep))
+        plt.close()
+
+
     #@register
     def emergency_save_model(self):
         """ Save training data when training is interrupted """
@@ -481,17 +466,6 @@ def second_derivative(model, x, y):
     u_yy = tp.gradient(u_y, y)
     del tp
     return u_xx, u_yy
-
-#     #return tf.stack([dde.grad.jacobian(y, x, j=0), dde.grad.jacobian(y, x, j=1) ], axis=1)[:,:,0]
-
-# # for some reason this doesn't work in eager execution which is suddently enabled here
-# def first_derivative(model, x, y):
-#     u = model(tf.stack([x, y], axis=1))
-#     dudx = tf.gradients(u, x)
-#     dudy = tf.gradients(u, y)
-
-#     return dudx, dudy
-    #return tf.stack([dde.grad.jacobian(y, x, j=0), dde.grad.jacobian(y, x, j=1) ], axis=1)[:,:,0]
 
 
 class Quad(dde.geometry.Polygon):
@@ -664,11 +638,13 @@ def plot_quad_errors(dde_polys, model, save=True, show=True):
 def plot_history(dir_path):
     (error_hist_pde, error_hist_bcs) = np.genfromtxt(dir_path + '/error_history.dat')
     loss_hist = np.genfromtxt(dir_path + '/loss_history.dat')
+    test_loss_hist = np.genfromtxt(dir_path + '/test_loss_history.dat')
 
 
     fig = plt.figure(figsize=(7,5))
     ax = fig.add_subplot(111)
     ax.semilogy(loss_hist,'k-')
+    ax.semilogy(test_loss_hist, 'k--')
     ax.set_xlabel('Epochs')
     ax.set_ylabel('Total Loss')
     fig.savefig(dir_path + '/loss_history.png')
@@ -687,9 +663,37 @@ def plot_history(dir_path):
     return
 
 
+def plot_error_history(dir_path):
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    test_error_distr_hist = []
+    train_error_distr_hist = []
+    ephs = []
+    show_every = 1
+    for train_ep_dir, test_ep_dir in zip(os.listdir(dir_path + '/error_distribution_history/'), os.listdir(dir_path + '/test_error_distribution_history/')):
+        ephs.append(int(test_ep_dir))
+
+        train_error_distribution_data = np.genfromtxt(dir_path + '/error_distribution_history/' + train_ep_dir + '/error_distribution_history.dat')
+        train_error_distr_hist.append(np.abs(train_error_distribution_data.flatten()))
+
+        test_error_distribution_data = np.genfromtxt(dir_path + '/test_error_distribution_history/' + test_ep_dir + '/test_error_distribution_history.dat')
+        test_error_distr_hist.append(np.abs(test_error_distribution_data.flatten()))
+
+    ephs=np.array(ephs)
+    ax.boxplot(train_error_distr_hist[::show_every], positions=ephs[::show_every], showfliers=False, widths=10)
+    ax.boxplot(test_error_distr_hist[::show_every], positions=ephs[::show_every]+20, showfliers=False, widths=10)
+    ## if ticks get cramped:
+    # for i, label in enumerate(ax.xaxis.get_ticklabels()):
+    #     if i%2 != 0: label.set_visible(False)
+    # for i, line in enumerate(ax.xaxis.get_ticklines()):
+    #     if i%2 != 0: line.set_visible(False)
+
+    plt.show()
+    return
+
 
 def get_results():
-    select_every = 5
+    select_every = 2
     quads_vertices = np.genfromtxt(load_model_dir_path + '/' + quads_filename)[0::select_every]
     quads_vertices = quads_vertices.reshape(len(quads_vertices), 4, 2)
 
@@ -718,10 +722,12 @@ def get_results():
                                             )
 
     ####### model predict
-    plot_quad_Bs(dde_polys, model)
-    plot_quad_errors(dde_polys, model)
+    # plot_quad_Bs(dde_polys, model)
+    # plot_quad_errors(dde_polys, model)
     if plot_histories:
         plot_history(load_model_dir_path)
+    
+    plot_error_history(load_model_dir_path)
 
 
 def train_model():
